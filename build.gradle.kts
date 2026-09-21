@@ -10,7 +10,7 @@ plugins {
 var modVersion = "6.0.1"
 
 group = "com.moulberry.axiom"
-version = "${modVersion}+26.2"
+version = "${modVersion}+26.3"
 description = "Serverside component for Axiom on Paper"
 
 java {
@@ -40,7 +40,7 @@ repositories {
 }
 
 dependencies {
-    paperweight.paperDevBundle("26.2.build.40-alpha")
+    paperweight.paperDevBundle("26.3.build.28-alpha")
 
     // Zstd Compression Library
     implementation(libs.zstd.jni)

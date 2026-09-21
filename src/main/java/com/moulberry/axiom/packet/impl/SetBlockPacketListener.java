@@ -4,6 +4,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.AxiomReflection;
+import com.moulberry.axiom.NetworkHelper;
 import com.moulberry.axiom.integration.Integration;
 import com.moulberry.axiom.integration.coreprotect.CoreProtectIntegration;
 import com.moulberry.axiom.packet.PacketHandler;
@@ -81,15 +82,12 @@ public class SetBlockPacketListener implements PacketHandler {
         }
 
         // Read packet
-        IntFunction<Map<BlockPos, BlockState>> mapFunction = this.plugin.limitCollection(Maps::newLinkedHashMapWithExpectedSize);
         IdMapper<BlockState> registry = this.plugin.getBlockRegistry(bukkitPlayer.getUniqueId());
-        Map<BlockPos, BlockState> blocks = friendlyByteBuf.readMap(mapFunction,
-                buf -> buf.readBlockPos(), buf -> buf.readById(registry::byIdOrThrow));
+        Map<BlockPos, BlockState> blocks = NetworkHelper.readLinkedHashMap(friendlyByteBuf, buf -> buf.readBlockPos(), buf -> buf.readById(registry::byIdOrThrow), this.plugin.getPacketCollectionReadLimit());
         boolean updateNeighbors = friendlyByteBuf.readBoolean();
         Set<BlockPos> preventUpdatesAt = Set.of();
         if (updateNeighbors) {
-            IntFunction<Set<BlockPos>> setFunction = this.plugin.limitCollection(Sets::newHashSetWithExpectedSize);
-            preventUpdatesAt = friendlyByteBuf.readCollection(setFunction, buf -> buf.readBlockPos());
+            preventUpdatesAt = NetworkHelper.readLinkedHashSet(friendlyByteBuf, buf -> buf.readBlockPos(), this.plugin.getPacketCollectionReadLimit());
         }
 
         if (this.plugin.logLargeBlockBufferChanges() && blocks.size() > 64) {
@@ -98,7 +96,7 @@ public class SetBlockPacketListener implements PacketHandler {
 
         int reason = friendlyByteBuf.readVarInt();
         boolean breaking = friendlyByteBuf.readBoolean();
-        BlockHitResult blockHit = friendlyByteBuf.readBlockHitResult();
+        BlockHitResult blockHit = NetworkHelper.readBlockHitResult(friendlyByteBuf);
         InteractionHand hand = friendlyByteBuf.readEnum(InteractionHand.class);
         int sequenceId = friendlyByteBuf.readVarInt();
 
