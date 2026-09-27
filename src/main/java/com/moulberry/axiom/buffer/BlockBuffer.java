@@ -22,8 +22,8 @@ import net.minecraft.world.level.chunk.PalettedContainer;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
@@ -31,8 +31,9 @@ public class BlockBuffer {
 
     public static final BlockState EMPTY_STATE = Blocks.VOID_AIR.defaultBlockState();
 
-    private static final Map<BlockState, Codec<PalettedContainer<BlockState>>> BLOCK_STATE_CODECS = new HashMap<>();
-    private static final Map<BlockState, IdMap<BlockState>> ID_MAPPERS = new HashMap<>();
+    // Populated lazily from packet threads on many regions at once, so computeIfAbsent must be atomic.
+    private static final Map<BlockState, Codec<PalettedContainer<BlockState>>> BLOCK_STATE_CODECS = new ConcurrentHashMap<>();
+    private static final Map<BlockState, IdMap<BlockState>> ID_MAPPERS = new ConcurrentHashMap<>();
 
     public static PalettedContainer<BlockState> createPalettedContainerForEmptyBlockState(BlockState emptyBlockState) {
         return VersionHelper.createPalettedContainer(BlockBuffer.getIdMapForEmptyBlockState(emptyBlockState), EMPTY_STATE);

@@ -8,6 +8,7 @@ import com.moulberry.axiom.blueprint.ServerBlueprintManager;
 import com.moulberry.axiom.blueprint.ServerBlueprintRegistry;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import net.minecraft.SharedConstants;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -43,9 +44,7 @@ public class UploadBlueprintPacketListener implements PacketHandler {
         ServerPlayer serverPlayer = ((CraftPlayer)player).getHandle();
 
         if (this.plugin.isMismatchedDataVersion(serverPlayer.getUUID())) {
-            serverPlayer.level().getServer().execute(() -> {
-                serverPlayer.sendSystemMessage(Component.literal("Axiom+ViaVersion: This feature isn't supported. Switch your client version to " + VersionHelper.getVersion() + " to use this"));
-            });
+            AxiomScheduler.global(() -> serverPlayer.sendSystemMessage(Component.literal("Axiom+ViaVersion: This feature isn't supported. Switch your client version to " + VersionHelper.getVersion() + " to use this")));
             friendlyByteBuf.writerIndex(friendlyByteBuf.readerIndex());
             return;
         }
@@ -74,9 +73,12 @@ public class UploadBlueprintPacketListener implements PacketHandler {
 
         String pathName = pathStr.substring(0, pathStr.length()-3);
 
-        serverPlayer.level().getServer().execute(() -> {
+        // Writing the blueprint is blocking file IO and touches no game state, so it runs off the
+        // region threads entirely. Only the registry update and the manifest broadcast come back.
+        Path blueprintFolder = this.plugin.blueprintFolder;
+        AxiomScheduler.async(() -> {
             try {
-                Path path = this.plugin.blueprintFolder.resolve(relative);
+                Path path = blueprintFolder.resolve(relative);
 
                 // Write file
                 try {
@@ -90,11 +92,13 @@ public class UploadBlueprintPacketListener implements PacketHandler {
                     return;
                 }
 
-                // Update registry
-                registry.blueprints().put("/" + pathName, rawBlueprint);
+                AxiomScheduler.global(() -> {
+                    // Update registry
+                    registry.blueprints().put("/" + pathName, rawBlueprint);
 
-                // Resend manifest
-                ServerBlueprintManager.sendManifest(serverPlayer.level().getServer().getPlayerList().getPlayers());
+                    // Resend manifest
+                    ServerBlueprintManager.sendManifest(serverPlayer.level().getServer().getPlayerList().getPlayers());
+                });
             } catch (Throwable t) {
                 serverPlayer.getBukkitEntity().kick(net.kyori.adventure.text.Component.text(
                         "An error occured while uploading blueprint: " + t.getMessage()));

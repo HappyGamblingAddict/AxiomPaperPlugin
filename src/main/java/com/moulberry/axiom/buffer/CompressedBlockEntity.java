@@ -14,17 +14,39 @@ import java.util.Objects;
 
 public record CompressedBlockEntity(int originalSize, byte compressionDict, byte[] compressed) {
 
-    private static ZstdDictCompress zstdDictCompress = null;
-    private static ZstdDictDecompress zstdDictDecompress = null;
+    /*
+     * A ZstdDictCompress/ZstdDictDecompress wraps a raw native context pointer and is explicitly
+     * NOT thread safe. On a regionised server several regions compress and decompress block entity
+     * NBT at the same time, so the contexts (and the scratch stream) are per thread. The dictionary
+     * bytes themselves are immutable and are only used to construct the contexts.
+     */
+    private static byte[] dictionaryBytes = null;
+
+    private static final ThreadLocal<ZstdDictCompress> zstdDictCompress = ThreadLocal.withInitial(() -> {
+        if (dictionaryBytes == null) {
+            throw new IllegalStateException("CompressedBlockEntity not initialized");
+        }
+        return new ZstdDictCompress(dictionaryBytes, Zstd.defaultCompressionLevel());
+    });
+
+    private static final ThreadLocal<ZstdDictDecompress> zstdDictDecompress = ThreadLocal.withInitial(() -> {
+        if (dictionaryBytes == null) {
+            throw new IllegalStateException("CompressedBlockEntity not initialized");
+        }
+        return new ZstdDictDecompress(dictionaryBytes);
+    });
 
     public static void initialize(AxiomPaper plugin) {
         try (InputStream is = Objects.requireNonNull(plugin.getResource("zstd_dictionaries/block_entities_v1.dict"))) {
-            byte[] bytes = is.readAllBytes();
-            zstdDictCompress = new ZstdDictCompress(bytes, Zstd.defaultCompressionLevel());
-            zstdDictDecompress = new ZstdDictDecompress(bytes);
+            dictionaryBytes = is.readAllBytes();
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+
+        // Build the contexts for this thread up front so a failure surfaces at enable rather than
+        // on the first block a player pastes.
+        zstdDictCompress.get();
+        zstdDictDecompress.get();
     }
 
     public static CompressedBlockEntity compress(CompoundTag tag, ByteArrayOutputStream baos) {
@@ -33,7 +55,7 @@ public record CompressedBlockEntity(int originalSize, byte compressionDict, byte
             DataOutputStream dos = new DataOutputStream(baos);
             NbtIo.write(tag, dos);
             byte[] uncompressed = baos.toByteArray();
-            byte[] compressed = Zstd.compress(uncompressed, zstdDictCompress);
+            byte[] compressed = Zstd.compress(uncompressed, zstdDictCompress.get());
             return new CompressedBlockEntity(uncompressed.length, (byte) 0, compressed);
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -44,7 +66,7 @@ public record CompressedBlockEntity(int originalSize, byte compressionDict, byte
         if (this.compressionDict != 0) throw new UnsupportedOperationException("Unknown compression dict: " + this.compressionDict);
 
         try {
-            byte[] nbt = Zstd.decompress(this.compressed, zstdDictDecompress, this.originalSize);
+            byte[] nbt = Zstd.decompress(this.compressed, zstdDictDecompress.get(), this.originalSize);
             return NbtIo.read(new DataInputStream(new ByteArrayInputStream(nbt)), AxiomPaper.PLUGIN.createNbtAccounter());
         } catch (IOException e) {
             throw new RuntimeException(e);

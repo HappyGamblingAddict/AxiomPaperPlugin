@@ -59,7 +59,7 @@ public class NbtSanitization {
     );
 
     public static void sanitizeEntity(CompoundTag entityRoot) {
-        if (AxiomPaper.PLUGIN.configuration.getBoolean("disable-entity-sanitization")) {
+        if (AxiomPaper.PLUGIN.isEntitySanitizationDisabled()) {
             return;
         }
 

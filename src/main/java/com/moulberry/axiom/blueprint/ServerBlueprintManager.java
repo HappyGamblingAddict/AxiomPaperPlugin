@@ -16,13 +16,14 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ServerBlueprintManager {
 
-    private static ServerBlueprintRegistry registry = null;
+    private static volatile ServerBlueprintRegistry registry = null;
 
     public static void initialize(Path blueprintDirectory) {
-        Map<String, RawBlueprint> map = new HashMap<>();
+        Map<String, RawBlueprint> map = new ConcurrentHashMap<>();
         loadRegistryFromFolder(map, blueprintDirectory, "/");
         registry = new ServerBlueprintRegistry(map);
     }

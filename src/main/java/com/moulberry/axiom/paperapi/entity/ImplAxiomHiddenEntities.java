@@ -13,21 +13,23 @@ import org.bukkit.entity.Marker;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ImplAxiomHiddenEntities {
 
-    private static final Set<Marker> hiddenMarkers = Collections.newSetFromMap(new WeakHashMap<>());
-    private static final Map<Object, UUID> hiddenDisplays = new WeakHashMap<>();
-    private static final Set<UUID> lastSentHiddenDisplays = new HashSet<>();
+    // hideMarkerGizmo/hideDisplayGizmo are part of the public Axiom API and can be called from any
+    // thread, while the resend logic below runs on the global region, so everything is concurrent.
+    private static final Set<Marker> hiddenMarkers = Collections.newSetFromMap(Collections.synchronizedMap(new WeakHashMap<>()));
+    private static final Map<Object, UUID> hiddenDisplays = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Set<UUID> lastSentHiddenDisplays = ConcurrentHashMap.newKeySet();
 
-    private static boolean resendIgnoredDisplays = false;
-    private static boolean hasSentIgnoredDisplaysToAPlayer = false;
+    private static volatile boolean resendIgnoredDisplays = false;
+    private static volatile boolean hasSentIgnoredDisplaysToAPlayer = false;
 
     public static boolean isMarkerHidden(Marker marker) {
         return hiddenMarkers.contains(marker);
@@ -84,7 +86,7 @@ public class ImplAxiomHiddenEntities {
 
         if (!hiddenDisplays.isEmpty()) {
             FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-            NetworkHelper.writeCollection(buf, hiddenDisplays.values(), (buffer, uuid) -> buffer.writeUUID(uuid));
+            NetworkHelper.writeCollection(buf, new ArrayList<>(hiddenDisplays.values()), (buffer, uuid) -> buffer.writeUUID(uuid));
             VersionHelper.sendCustomPayloadToAll(players, "axiom:ignore_display_entities", ByteBufUtil.getBytes(buf));
         }
     }
