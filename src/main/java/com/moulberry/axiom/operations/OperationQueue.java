@@ -71,6 +71,16 @@ public class OperationQueue {
             return;
         }
 
+        if (claimed == 0) {
+            // Nothing left to hand out. If the last claimed chunks have also been processed the
+            // operation is done. This check lives here, on the global region, because claiming
+            // already happens there and it removes the cross-thread race entirely.
+            if (operation.outstandingChunks() == 0 && !operation.hasUnclaimedChunks()) {
+                this.finish(level, operation);
+            }
+            return;
+        }
+
         for (int i = 0; i < claimed; i++) {
             operation.chunkClaimed();
             try {
@@ -130,16 +140,21 @@ public class OperationQueue {
     }
 
     private void maybeComplete(ServerLevel level, PendingOperation operation) {
-        if (operation.outstandingChunks() > 0) {
+        // Zero outstanding on its own is not "done": the operation may still have chunks it has not
+        // claimed yet, and between claim batches the outstanding count transiently reaches zero.
+        if (operation.outstandingChunks() > 0 || operation.hasUnclaimedChunks()) {
             return;
         }
 
-        // Exactly one region thread may finish the operation. Several can be inside this method at
-        // once once the last chunks land, and completion sends a network response.
+        this.finish(level, operation);
+    }
+
+    /** Exactly one caller completes the operation; the CAS inside tryFinish decides which. */
+    private void finish(ServerLevel level, PendingOperation operation) {
         if (!this.operations.remove(operation)) {
             return;
         }
-        if (operation.isFinished()) {
+        if (!operation.tryFinish()) {
             return;
         }
 
@@ -154,6 +169,7 @@ public class OperationQueue {
         if (!this.operations.remove(operation)) {
             return;
         }
+        operation.tryFinish();
 
         try {
             operation.fail(t);

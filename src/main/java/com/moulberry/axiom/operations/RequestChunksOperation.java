@@ -111,6 +111,11 @@ public class RequestChunksOperation extends PendingOperation {
     }
 
     @Override
+    public boolean hasUnclaimedChunks() {
+        return this.claimedChunks < this.remainingChunks.size();
+    }
+
+    @Override
     protected boolean shouldLoadChunk(ServerLevel level, ChunkPos pos) {
         int distance = Math.abs(this.playerChunkX - pos.x()) + Math.abs(this.playerChunkZ - pos.z());
         return distance < this.maxChunkLoadDistance;

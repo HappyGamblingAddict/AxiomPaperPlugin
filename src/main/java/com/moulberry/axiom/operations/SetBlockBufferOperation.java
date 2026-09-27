@@ -126,6 +126,11 @@ public class SetBlockBufferOperation extends PendingOperation {
     }
 
     @Override
+    public boolean hasUnclaimedChunks() {
+        return this.claimedChunks < this.remainingChunks.size();
+    }
+
+    @Override
     protected boolean shouldLoadChunk(ServerLevel level, ChunkPos pos) {
         int distance = Math.abs(this.playerChunkX - pos.x()) + Math.abs(this.playerChunkZ - pos.z());
         return distance < this.maxChunkLoadDistance;
@@ -311,7 +316,7 @@ public class SetBlockBufferOperation extends PendingOperation {
 
     @Override
     protected void complete(ServerLevel level) {
-        if (markFinished() && this.sendGameMasterBlockWarning.get()) {
+        if (this.sendGameMasterBlockWarning.get()) {
             AxiomScheduler.runOnEntity(this.player.getBukkitEntity(), () -> this.player.sendSystemMessage(
                 Component.literal("Unable to set data for Game Master block since you don't have op").withStyle(ChatFormatting.RED)));
         }

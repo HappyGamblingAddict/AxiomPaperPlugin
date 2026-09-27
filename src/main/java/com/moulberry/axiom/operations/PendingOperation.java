@@ -52,10 +52,21 @@ public abstract class PendingOperation {
     }
 
     /**
+     * Whether {@link #claimChunks} can still hand out work. This is deliberately distinct from
+     * {@link #outstandingChunks}(): zero outstanding is a transient state between claim batches,
+     * not the same as "nothing left to do", and completing on it alone truncates large pastes.
+     */
+    public abstract boolean hasUnclaimedChunks();
+
+    /**
      * Claims the right to finish this operation, returning false if somebody else already did.
      * Several regions can observe zero outstanding chunks at the same time, so exactly one of them
      * has to win.
      */
+    public final boolean tryFinish() {
+        return this.finished.compareAndSet(false, true);
+    }
+
     protected final boolean markFinished() {
         return this.finished.compareAndSet(false, true);
     }

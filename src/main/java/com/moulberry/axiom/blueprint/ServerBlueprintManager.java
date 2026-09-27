@@ -3,6 +3,7 @@ package com.moulberry.axiom.blueprint;
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.restrictions.AxiomPermission;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import net.minecraft.network.FriendlyByteBuf;
@@ -32,44 +33,46 @@ public class ServerBlueprintManager {
     private static final Identifier PACKET_BLUEPRINT_MANIFEST_IDENTIFIER = VersionHelper.createIdentifier("axiom:blueprint_manifest");
 
     public static void sendManifest(List<ServerPlayer> serverPlayers) {
-        if (registry != null) {
-            List<ServerPlayer> sendTo = new ArrayList<>();
+        if (registry == null || registry.blueprints().isEmpty()) {
+            return;
+        }
 
-            for (ServerPlayer serverPlayer : serverPlayers) {
-                CraftPlayer craftPlayer = serverPlayer.getBukkitEntity();
-                if (AxiomPaper.PLUGIN.canUseAxiom(craftPlayer, AxiomPermission.BLUEPRINT_MANIFEST)) {
-                    sendTo.add(serverPlayer);
+        // Build the payload first, then check permissions per player on that player's own region.
+        // Checking up front would read every player's permission state from whatever thread called
+        // this, which is the global region for most callers.
+        List<byte[]> payloads = new ArrayList<>();
+
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        buf.writeBoolean(true); // replace
+
+        for (Map.Entry<String, RawBlueprint> entry : registry.blueprints().entrySet()) {
+            buf.writeUtf(entry.getKey());
+            RawBlueprint.writeHeader(buf, entry.getValue());
+
+            if (buf.writerIndex() > MAX_SIZE) {
+                // Finish current packet
+                buf.writeUtf("");
+                payloads.add(ByteBufUtil.getBytes(buf));
+
+                // Continue
+                buf.clear();
+                buf.writeBoolean(false); // don't replace
+            }
+        }
+
+        buf.writeUtf("");
+        payloads.add(ByteBufUtil.getBytes(buf));
+
+        for (ServerPlayer serverPlayer : serverPlayers) {
+            CraftPlayer craftPlayer = serverPlayer.getBukkitEntity();
+            AxiomScheduler.runOnEntity(craftPlayer, () -> {
+                if (!AxiomPaper.PLUGIN.canUseAxiom(craftPlayer, AxiomPermission.BLUEPRINT_MANIFEST)) {
+                    return;
                 }
-            }
-
-            if (sendTo.isEmpty()) return;
-
-            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-            buf.writeBoolean(true); // replace
-
-            for (Map.Entry<String, RawBlueprint> entry : registry.blueprints().entrySet()) {
-                buf.writeUtf(entry.getKey());
-                RawBlueprint.writeHeader(buf, entry.getValue());
-
-                if (buf.writerIndex() > MAX_SIZE) {
-                    // Finish and send current packet
-                    buf.writeUtf("");
-                    byte[] bytes = ByteBufUtil.getBytes(buf);
-                    for (ServerPlayer serverPlayer : sendTo) {
-                        VersionHelper.sendCustomPayload(serverPlayer, PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, bytes);
-                    }
-
-                    // Continue
-                    buf.clear();
-                    buf.writeBoolean(false); // don't replace
+                for (byte[] bytes : payloads) {
+                    VersionHelper.sendCustomPayload(serverPlayer, PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, bytes);
                 }
-            }
-
-            buf.writeUtf("");
-            byte[] bytes = ByteBufUtil.getBytes(buf);
-            for (ServerPlayer serverPlayer : sendTo) {
-                VersionHelper.sendCustomPayload(serverPlayer, PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, bytes);
-            }
+            });
         }
     }
 
