@@ -113,7 +113,7 @@ public class RequestChunkDataPacketListener implements PacketHandler {
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
-        Long2ObjectOpenHashMap<PalettedContainer<BlockState>> sendingSections = new Long2ObjectOpenHashMap<>();
+        Long2ObjectOpenHashMap<byte[]> sendingSections = new Long2ObjectOpenHashMap<>();
         Long2ObjectOpenHashMap<CompressedBlockEntity> sendingBlockEntities = new Long2ObjectOpenHashMap<>();
 
         LongSet chunkFutures = new LongOpenHashSet();
@@ -189,8 +189,11 @@ public class RequestChunkDataPacketListener implements PacketHandler {
                     if (section.hasOnlyAir()) {
                         sendingSections.put(pos, null);
                     } else {
-                        PalettedContainer<BlockState> container = section.getStates();
-                        sendingSections.put(pos, container);
+                        // Serialised immediately: a PalettedContainer is a live view into the chunk
+                        // and the response may be written from a different region than this one.
+                        FriendlyByteBuf sectionBuf = new FriendlyByteBuf(Unpooled.buffer());
+                        section.getStates().write(sectionBuf);
+                        sendingSections.put(pos, ByteBufUtil.getBytes(sectionBuf));
 
                         if (sendBlockEntitiesInChunks) {
                             Set<Map.Entry<BlockPos, BlockEntity>> entrySet = chunk.blockEntities.entrySet();
@@ -234,13 +237,15 @@ public class RequestChunkDataPacketListener implements PacketHandler {
         if (chunkFutures.isEmpty()) {
             sendResponse(player, id, sendingBlockEntities, sendingSections);
         } else {
-            this.plugin.addPendingOperation(level, new RequestChunksOperation(player, id, chunkFutures, sendBlockEntityForPendingChunks, sendSectionsForPendingChunks,
-                sendBlockEntitiesInChunks, sendingSections, sendingBlockEntities, baos));
+            // Everything already read above has to be carried over: the operation only collects
+            // what the owning regions read, and the two sources are merged when it finishes.
+            this.plugin.addPendingOperation(level, new RequestChunksOperation(level, player, id, chunkFutures, sendBlockEntityForPendingChunks,
+                sendSectionsForPendingChunks, sendBlockEntitiesInChunks, sendingSections, sendingBlockEntities));
         }
     }
 
     public static void sendResponse(ServerPlayer player, long id, Long2ObjectOpenHashMap<CompressedBlockEntity> sendingBlockEntities,
-        Long2ObjectOpenHashMap<PalettedContainer<BlockState>> sendingSections) {
+        Long2ObjectOpenHashMap<byte[]> sendingSections) {
         boolean firstPart = true;
         int maxSize = 0x100000 - 64; // Leeway of 64 bytes
 
@@ -300,16 +305,16 @@ public class RequestChunkDataPacketListener implements PacketHandler {
 
         var sectionIterator = sendingSections.long2ObjectEntrySet().fastIterator();
         while (sectionIterator.hasNext()) {
-            Long2ObjectMap.Entry<PalettedContainer<BlockState>> entry = sectionIterator.next();
+            Long2ObjectMap.Entry<byte[]> entry = sectionIterator.next();
             int beforeWriterIndex = buf.writerIndex();
 
             buf.writeLong(entry.getLongKey());
-            var container = entry.getValue();
-            if (container == null) {
+            var serialized = entry.getValue();
+            if (serialized == null) {
                 buf.writeBoolean(false);
             } else {
                 buf.writeBoolean(true);
-                entry.getValue().write(buf);
+                buf.writeBytes(serialized);
             }
 
             if (buf.writerIndex() >= maxSize) {

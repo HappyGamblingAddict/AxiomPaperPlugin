@@ -6,7 +6,7 @@ public class AxiomPermissionSet {
 
     public final EnumSet<AxiomPermission> explicitlyAllowed;
     public final EnumSet<AxiomPermission> explicitlyDenied;
-    private EnumSet<AxiomPermission> calculated = null;
+    private volatile EnumSet<AxiomPermission> calculated = null;
 
     public static AxiomPermissionSet ALL = new AxiomPermissionSet(EnumSet.of(AxiomPermission.ALL), EnumSet.noneOf(AxiomPermission.class));
     public static AxiomPermissionSet DEFAULT = new AxiomPermissionSet(EnumSet.of(AxiomPermission.DEFAULT), EnumSet.noneOf(AxiomPermission.class));
@@ -58,21 +58,26 @@ public class AxiomPermissionSet {
     private static final AxiomPermission[] PERMISSIONS = AxiomPermission.values();
 
     private void calculate() {
+        // Build into a local and publish once. A RegularEnumSet is a bare long bitmask, so
+        // publishing it and then mutating it in place would let another region read a partially
+        // built mask (and lose the transitive parent resolution, which reads back the same set).
+        EnumSet<AxiomPermission> result;
         if (this.explicitlyAllowed.contains(AxiomPermission.ALL)) {
-            this.calculated = EnumSet.allOf(AxiomPermission.class);
-            return;
-        }
-
-        this.calculated = EnumSet.noneOf(AxiomPermission.class);
-        for (AxiomPermission value : PERMISSIONS) {
-            if (this.explicitlyAllowed.contains(value)) {
-                this.calculated.add(value);
-            } else if (!this.explicitlyDenied.contains(value) && value.parent != null) {
-                if (this.calculated.contains(value.parent)) {
-                    this.calculated.add(value);
+            result = EnumSet.allOf(AxiomPermission.class);
+        } else {
+            result = EnumSet.noneOf(AxiomPermission.class);
+            for (AxiomPermission value : PERMISSIONS) {
+                if (this.explicitlyAllowed.contains(value)) {
+                    result.add(value);
+                } else if (!this.explicitlyDenied.contains(value) && value.parent != null) {
+                    if (result.contains(value.parent)) {
+                        result.add(value);
+                    }
                 }
             }
         }
+
+        this.calculated = result;
     }
 
 }

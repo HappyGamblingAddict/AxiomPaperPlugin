@@ -32,18 +32,25 @@ import org.bukkit.entity.Player;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ViaVersionHelper {
 
-    private static final Int2ObjectOpenHashMap<IdMapper<BlockState>> blockRegistryCache = new Int2ObjectOpenHashMap<>();
-    private static final Int2ObjectOpenHashMap<String> blockRegistryErrorCache = new Int2ObjectOpenHashMap<>();
+    // Written from whichever region handles a player's hello packet, so both caches need to
+    // tolerate concurrent first-touch.
+    private static final Map<Integer, IdMapper<BlockState>> blockRegistryCache = new ConcurrentHashMap<>();
+    private static final Map<Integer, String> blockRegistryErrorCache = new ConcurrentHashMap<>();
 
     public static IdMapper<BlockState> getBlockRegistryForVersion(IdMapper<BlockState> mapper, int playerVersion) {
-        if (blockRegistryErrorCache.containsKey(playerVersion)) {
-            throw new RuntimeException(blockRegistryErrorCache.get(playerVersion));
+        // Success is checked first and is never overwritten by an error: a version that resolved
+        // once must keep resolving, even if a later concurrent attempt failed for its own reason.
+        IdMapper<BlockState> cached = blockRegistryCache.get(playerVersion);
+        if (cached != null) {
+            return cached;
         }
-        if (blockRegistryCache.containsKey(playerVersion)) {
-            return blockRegistryCache.get(playerVersion);
+        String cachedError = blockRegistryErrorCache.get(playerVersion);
+        if (cachedError != null) {
+            throw new RuntimeException(cachedError);
         }
 
         List<ProtocolPathEntry> path = Via.getManager().getProtocolManager().getProtocolPath(playerVersion,

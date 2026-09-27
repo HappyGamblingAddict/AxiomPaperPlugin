@@ -74,6 +74,11 @@ tasks {
         // Set the release flag. This configures what version bytecode the compiler will emit, as well as what JDK APIs are usable.
         // See https://openjdk.java.net/jeps/247 for more information.
         options.release.set(21)
+
+        // javac defaults to -Xmaxerrs 100, so a broken change produces a wall of errors and every
+        // task in the graph still gets a chance to run. Bailing after a handful keeps the feedback
+        // loop short.
+        options.compilerArgs.addAll(listOf("-Xmaxerrs", "10"))
     }
     javadoc {
         options.encoding = Charsets.UTF_8.name() // We want UTF-8 for everything

@@ -6,6 +6,7 @@ import com.moulberry.axiom.packet.impl.RequestChunkDataPacketListener;
 import com.moulberry.axiom.packet.impl.SetBlockBufferPacketListener;
 import com.moulberry.axiom.packet.impl.UpdateAnnotationPacketListener;
 import com.moulberry.axiom.packet.impl.UploadBlueprintPacketListener;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
@@ -76,7 +77,10 @@ public class AxiomBigPayloadHandler extends MessageToMessageDecoder<ByteBuf> {
                     } else {
                         byte[] bytes = ByteBufUtil.getBytes(buf);
 
-                        player.level().getServer().execute(() -> {
+                        // Hand off to the player's own region, matching how the ordinary plugin
+                        // message path is dispatched. On Folia the global region is not allowed to
+                        // read entity state, which every handler does first (permissions, world).
+                        AxiomScheduler.runOnEntity(player.getBukkitEntity(), () -> {
                             RegistryFriendlyByteBuf friendlyByteBuf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(bytes), player.registryAccess());
                             callReceive(handler, player, friendlyByteBuf, identifier);
                         });

@@ -57,7 +57,7 @@ public class HelloPacketListener implements PacketHandler {
                 text = Component.text("Unable to use Axiom, server hasn't updated Axiom yet." + versions);
             }
 
-            String unsupportedAxiomVersion = plugin.configuration.getString("unsupported-axiom-version");
+            String unsupportedAxiomVersion = plugin.getUnsupportedAxiomVersion();
             if (unsupportedAxiomVersion == null) unsupportedAxiomVersion = "kick";
             if (unsupportedAxiomVersion.equals("warn")) {
                 player.sendMessage(text.color(NamedTextColor.RED));
@@ -73,7 +73,7 @@ public class HelloPacketListener implements PacketHandler {
 
         int serverDataVersion = DFUHelper.DATA_VERSION;
         if (protocolVersion != SharedConstants.getProtocolVersion()) {
-            String incompatibleDataVersion = plugin.configuration.getString("incompatible-data-version");
+            String incompatibleDataVersion = plugin.getIncompatibleDataVersion();
             if (incompatibleDataVersion == null) incompatibleDataVersion = "warn";
 
             Component incompatibleWarning = Component.text("Axiom: Incompatible data version detected (client " + dataVersion +
@@ -115,7 +115,7 @@ public class HelloPacketListener implements PacketHandler {
         }
 
         // Call handshake event
-        int maxBufferSize = this.plugin.configuration.getInt("max-block-buffer-packet-size");
+        int maxBufferSize = this.plugin.getMaxBlockBufferPacketSize();
         AxiomHandshakeEvent handshakeEvent = new AxiomHandshakeEvent(player, maxBufferSize);
         Bukkit.getPluginManager().callEvent(handshakeEvent);
         if (handshakeEvent.isCancelled()) {

@@ -8,6 +8,7 @@ import com.moulberry.axiom.integration.Integration;
 import com.moulberry.axiom.integration.coreprotect.CoreProtectIntegration;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
@@ -118,39 +119,40 @@ public class SetBlockPacketListener implements PacketHandler {
             }
         }
 
+        // A single Axiom edit regularly spans several chunks, and each chunk can be owned by a
+        // different region. Group by chunk and hand every group to its own region.
+        //
+        // The neighbour-updating pass and the suppressed "no updates" pass are dispatched as two
+        // separate waves over all chunks: the original single threaded code applied every
+        // neighbour-updating block first and only then the suppressed ones, and setWithoutUpdates
+        // depends on that ordering so it sees the final state of the blocks placed around it.
+        Map<Long, List<Map.Entry<BlockPos, BlockState>>> blocksPerChunk = new LinkedHashMap<>();
+        for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+            blocksPerChunk.computeIfAbsent(chunkKey(entry.getKey()), k -> new ArrayList<>()).add(entry);
+        }
+
+        // Captured here, on the player's own region: the per-chunk region tasks below may not own
+        // the player, and CoreProtect logging is not region safe.
+        final String actorName = bukkitPlayer.getName();
+
         // Update blocks
-        if (updateNeighbors) {
-            if (preventUpdatesAt.isEmpty()) {
-                for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
-                    BlockPos blockPos = entry.getKey();
-                    BlockState blockState = entry.getValue();
-
-                    if (!canBreakOrPlace(bukkitPlayer, blockState, world, blockPos)) {
-                        continue;
-                    }
-
-                    boolean logPlacement = false;
-
-                    if (CoreProtectIntegration.isEnabled()) {
-                        BlockState old = player.level().getBlockState(blockPos);
-                        if (old != blockState) {
-                            CoreProtectIntegration.logRemoval(bukkitPlayer.getName(), old, world, blockPos);
-                            logPlacement = true;
-                        }
-                    }
-
-                    // Place block
-                    player.level().setBlock(blockPos, blockState, 3);
-
-                    if (logPlacement) {
-                        CoreProtectIntegration.logPlacement(bukkitPlayer.getName(), blockState, world, blockPos);
-                    }
+        if (updateNeighbors && preventUpdatesAt.isEmpty()) {
+            dispatchPerChunk(world, blocksPerChunk, chunkBlocks -> {
+                for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks) {
+                    applyBlock(bukkitPlayer, actorName, player, world, entry.getKey(), entry.getValue(), 3);
                 }
-            } else {
+            }, bukkitPlayer);
+        } else if (updateNeighbors) {
+            // preventUpdatesAt is consulted for the neighbours of every block, and a neighbour can
+            // live in a different chunk than the block itself, so every region task needs the whole
+            // set rather than just its own chunk's slice.
+            Set<BlockPos> preventAt = preventUpdatesAt;
+
+            // Wave 1: place everything that does get neighbour updates.
+            dispatchPerChunk(world, blocksPerChunk, chunkBlocks -> {
                 Direction[] directions = Direction.values();
                 BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
-                Map<BlockPos, BlockState> delayedSetWithoutUpdates = new LinkedHashMap<>(Math.min(blocks.size(), preventUpdatesAt.size()));
-                for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+                for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks) {
                     BlockPos blockPos = entry.getKey();
                     BlockState blockState = entry.getValue();
 
@@ -163,83 +165,111 @@ public class SetBlockPacketListener implements PacketHandler {
                     // but that case is rare enough for it not to matter
                     boolean updateNeighborsForThisBlock = true;
                     for (Direction direction : directions) {
-                        if (preventUpdatesAt.contains(mutable.setWithOffset(blockPos, direction))) {
+                        if (preventAt.contains(mutable.setWithOffset(blockPos, direction))) {
                             updateNeighborsForThisBlock = false;
                             break;
                         }
                     }
 
-                    if (preventUpdatesAt.contains(blockPos)) {
-                        delayedSetWithoutUpdates.put(blockPos, blockState);
-                        if (!updateNeighborsForThisBlock) {
-                            continue;
-                        }
+                    if (preventAt.contains(blockPos) && !updateNeighborsForThisBlock) {
+                        continue; // fully suppressed, handled in wave 2
                     }
 
-                    boolean logPlacement = false;
+                    applyBlock(bukkitPlayer, actorName, player, world, blockPos, blockState, updateNeighborsForThisBlock ? 3 : 18);
+                }
+            }, bukkitPlayer);
 
-                    if (CoreProtectIntegration.isEnabled()) {
-                        BlockState old = player.level().getBlockState(blockPos);
-                        if (old != blockState) {
-                            CoreProtectIntegration.logRemoval(bukkitPlayer.getName(), old, world, blockPos);
-                            logPlacement = true;
-                        }
-                    }
-
-                    player.level().setBlock(blockPos, blockState, updateNeighborsForThisBlock ? 3 : 18);
-
-                    if (logPlacement) {
-                        CoreProtectIntegration.logPlacement(bukkitPlayer.getName(), blockState, world, blockPos);
+            // Wave 2: the suppressed blocks. Region tasks are always tick deferred, so within one
+            // chunk wave 2 is ordered after wave 1, but across regions the two run in parallel and
+            // a boundary block may observe its neighbour before wave 1 has landed.
+            dispatchPerChunk(world, blocksPerChunk, chunkBlocks -> {
+                for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks) {
+                    if (preventAt.contains(entry.getKey())) {
+                        setWithoutUpdates(bukkitPlayer, actorName, entry.getValue(), world, entry.getKey(), player);
                     }
                 }
-                for (Map.Entry<BlockPos, BlockState> entry : delayedSetWithoutUpdates.entrySet()) {
-                    setWithoutUpdates(bukkitPlayer, entry.getValue(), world, entry.getKey(), player);
-                }
-            }
+            }, bukkitPlayer);
         } else {
-            for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
-                BlockPos blockPos = entry.getKey();
-                BlockState blockState = entry.getValue();
-
-                setWithoutUpdates(bukkitPlayer, blockState, world, blockPos, player);
-            }
+            dispatchPerChunk(world, blocksPerChunk, chunkBlocks -> {
+                for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks) {
+                    setWithoutUpdates(bukkitPlayer, actorName, entry.getValue(), world, entry.getKey(), player);
+                }
+            }, bukkitPlayer);
         }
 
         if (!breaking) {
             BlockPos clickedPos = blockPlaceContext.getClickedPos();
 
             if (blocks.containsKey(clickedPos)) {
-                // Disallow in unloaded chunks
-                if (!player.level().isLoaded(clickedPos)) {
-                    return;
-                }
-
-                BlockState desiredBlockState = blocks.get(clickedPos);
-                BlockState actualBlockState = player.level().getBlockState(clickedPos);
-                Block actualBlock = actualBlockState.getBlock();
-
-                // Ensure block is correct
-                if (desiredBlockState == null || desiredBlockState.isAir() || actualBlockState.isAir()) return;
-                if (desiredBlockState.getBlock() != actualBlock) return;
-
-                // Check plot squared
-                if (!Integration.canPlaceBlock(bukkitPlayer, new Location(world, clickedPos.getX(), clickedPos.getY(), clickedPos.getZ()))) {
-                    return;
-                }
-
+                // Read the held item here, on the player's own region, rather than inside the
+                // chunk's region task, which may not own the player.
                 ItemStack inHand = player.getItemInHand(hand);
 
-                BlockItem.updateCustomBlockEntityTag(player.level(), player, clickedPos, inHand);
-
-                BlockEntity blockEntity = player.level().getBlockEntity(clickedPos);
-                if (blockEntity != null) {
-                    blockEntity.applyComponentsFromItemStack(inHand);
-                }
-
-                if (!(actualBlock instanceof BedBlock) && !(actualBlock instanceof DoublePlantBlock) && !(actualBlock instanceof DoorBlock)) {
-                    actualBlock.setPlacedBy(player.level(), clickedPos, actualBlockState, player, inHand);
-                }
+                AxiomScheduler.runInRegion(player.level(), clickedPos,
+                    () -> finishPlacement(bukkitPlayer, player, world, inHand, blocks, clickedPos));
             }
+        }
+    }
+
+    private static long chunkKey(BlockPos pos) {
+        return net.minecraft.world.level.ChunkPos.asLong(pos.getX(), pos.getZ());
+    }
+
+    /** Runs {@code body} once per chunk, on the region that owns that chunk. */
+    private void dispatchPerChunk(CraftWorld world, Map<Long, List<Map.Entry<BlockPos, BlockState>>> blocksPerChunk,
+                                  java.util.function.Consumer<List<Map.Entry<BlockPos, BlockState>>> body, Player bukkitPlayer) {
+        for (List<Map.Entry<BlockPos, BlockState>> chunkBlocks : blocksPerChunk.values()) {
+            if (chunkBlocks.isEmpty()) continue;
+            BlockPos first = chunkBlocks.get(0).getKey();
+            AxiomScheduler.region(world, first.getX() >> 4, first.getZ() >> 4, () -> {
+                try {
+                    body.accept(chunkBlocks);
+                } catch (Throwable t) {
+                    // This runs on a region that may not own the player, and kicking is an entity
+                    // mutation, so bounce it onto the player's own region.
+                    AxiomScheduler.runOnEntity(bukkitPlayer,
+                        () -> bukkitPlayer.kick(net.kyori.adventure.text.Component.text("An error occured while placing blocks: " + t.getMessage())));
+                }
+            });
+        }
+    }
+
+    /** Runs on the region owning {@code clickedPos}. */
+    private void finishPlacement(Player bukkitPlayer, ServerPlayer player, CraftWorld world, ItemStack inHand, Map<BlockPos, BlockState> blocks, BlockPos clickedPos) {
+        try {
+            // Disallow in unloaded chunks
+            if (!player.level().isLoaded(clickedPos)) {
+                return;
+            }
+
+            BlockState desiredBlockState = blocks.get(clickedPos);
+            BlockState actualBlockState = player.level().getBlockState(clickedPos);
+            Block actualBlock = actualBlockState.getBlock();
+
+            // Ensure block is correct
+            if (desiredBlockState == null || desiredBlockState.isAir() || actualBlockState.isAir()) return;
+            if (desiredBlockState.getBlock() != actualBlock) return;
+
+            // Check plot squared
+            if (!Integration.canPlaceBlock(bukkitPlayer, new Location(world, clickedPos.getX(), clickedPos.getY(), clickedPos.getZ()))) {
+                return;
+            }
+
+            BlockItem.updateCustomBlockEntityTag(player.level(), player, clickedPos, inHand);
+
+            BlockEntity blockEntity = player.level().getBlockEntity(clickedPos);
+            if (blockEntity != null) {
+                blockEntity.applyComponentsFromItemStack(inHand);
+            }
+
+            if (!(actualBlock instanceof BedBlock) && !(actualBlock instanceof DoublePlantBlock) && !(actualBlock instanceof DoorBlock)) {
+                actualBlock.setPlacedBy(player.level(), clickedPos, actualBlockState, player, inHand);
+            }
+        } catch (Throwable t) {
+            // This may run on a region that does not own the player, and kicking is an entity
+            // mutation, so bounce it onto the player's own region.
+            AxiomScheduler.runOnEntity(bukkitPlayer,
+                () -> bukkitPlayer.kick(net.kyori.adventure.text.Component.text("An error occured while finishing block placement: " + t.getMessage())));
         }
     }
 
@@ -266,10 +296,29 @@ public class SetBlockPacketListener implements PacketHandler {
         // Call BlockMultiPlace / BlockPlace event
         if (!breaking) {
             List<org.bukkit.block.BlockState> blockStates = new ArrayList<>();
+            boolean anyForeign = false;
             for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+                // Only describe blocks this thread may read: the event has to be constructed and
+                // fired on one thread, and on a regionised server that is the player's region.
+                if (!AxiomScheduler.ownsRegion(world, entry.getKey().getX() >> 4, entry.getKey().getZ() >> 4)) {
+                    anyForeign = true;
+                    continue;
+                }
                 BlockState existing = player.level().getBlockState(entry.getKey());
                 if (existing.canBeReplaced()) {
                     blockStates.add(new AxiomPlacingCraftBlockState(world, entry.getKey(), entry.getValue()));
+                }
+            }
+
+            if (blockStates.isEmpty() && anyForeign && !blocks.isEmpty()) {
+                // Every block is in a region this thread may not read, so nothing could be
+                // described above. Fire anyway (with the clicked position, which needs no world
+                // read) rather than firing no place event at all, which would let a client edit
+                // entirely outside its own region without protection plugins ever seeing it.
+                BlockPos clickedPos = blockHit.getBlockPos();
+                BlockState clickedState = blocks.get(clickedPos);
+                if (clickedState != null) {
+                    blockStates.add(new AxiomPlacingCraftBlockState(world, clickedPos, clickedState));
                 }
             }
 
@@ -290,7 +339,26 @@ public class SetBlockPacketListener implements PacketHandler {
         return true;
     }
 
-    private void setWithoutUpdates(Player bukkitPlayer, BlockState blockState, CraftWorld world, BlockPos blockPos, ServerPlayer player) {
+    /** Runs on the region owning {@code blockPos}. */
+    private void applyBlock(Player bukkitPlayer, String actorName, ServerPlayer player, CraftWorld world, BlockPos blockPos, BlockState blockState, int flags) {
+        boolean logPlacement = false;
+
+        if (CoreProtectIntegration.isEnabled()) {
+            BlockState old = player.level().getBlockState(blockPos);
+            if (old != blockState) {
+                CoreProtectIntegration.logRemoval(actorName, old, world, blockPos);
+                logPlacement = true;
+            }
+        }
+
+        player.level().setBlock(blockPos, blockState, flags);
+
+        if (logPlacement) {
+            CoreProtectIntegration.logPlacement(actorName, blockState, world, blockPos);
+        }
+    }
+
+    private void setWithoutUpdates(Player bukkitPlayer, String actorName, BlockState blockState, CraftWorld world, BlockPos blockPos, ServerPlayer player) {
         if (!canBreakOrPlace(bukkitPlayer, blockState, world, blockPos)) {
             return;
         }
@@ -385,7 +453,7 @@ public class SetBlockPacketListener implements PacketHandler {
             }
 
             if (CoreProtectIntegration.isEnabled()) {
-                String changedBy = player.getBukkitEntity().getName();
+                String changedBy = actorName;
                 BlockPos changedPos = new BlockPos(bx, by, bz);
 
                 CoreProtectIntegration.logRemoval(changedBy, old, world, changedPos);

@@ -1,5 +1,7 @@
 package com.moulberry.axiom;
 
+import com.destroystokyo.paper.event.entity.EntityAddToWorldEvent;
+import com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent;
 import com.moulberry.axiom.blueprint.ServerBlueprintManager;
 import com.moulberry.axiom.buffer.CompressedBlockEntity;
 import com.moulberry.axiom.commands.AxiomDebugCommand;
@@ -20,6 +22,7 @@ import com.moulberry.axiom.paperapi.block.ImplServerCustomBlocks;
 import com.moulberry.axiom.restrictions.AxiomPermission;
 import com.moulberry.axiom.restrictions.AxiomPermissionSet;
 import com.moulberry.axiom.restrictions.Restrictions;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import com.moulberry.axiom.world_properties.server.ServerWorldPropertiesRegistry;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
@@ -28,6 +31,7 @@ import io.papermc.paper.event.player.PlayerFailMoveEvent;
 import io.papermc.paper.event.world.WorldGameRuleChangeEvent;
 import io.papermc.paper.network.ChannelInitializeListener;
 import io.papermc.paper.network.ChannelInitializeListenerHolder;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import net.kyori.adventure.key.Key;
 import net.kyori.adventure.text.Component;
@@ -54,7 +58,9 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.server.PluginDisableEvent;
+import org.bukkit.craftbukkit.CraftWorld;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.Messenger;
 import org.checkerframework.checker.nullness.qual.NonNull;
@@ -81,11 +87,13 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     public final Map<UUID, Restrictions> playerRestrictions = new ConcurrentHashMap<>();
     public final Map<UUID, IdMapper<BlockState>> playerBlockRegistry = new ConcurrentHashMap<>();
     public final Map<UUID, Integer> playerProtocolVersion = new ConcurrentHashMap<>();
-    private final Map<UUID, AxiomPermissionSet> playerPermissions = new HashMap<>();
-    private final Map<UUID, PlotSquaredIntegration.PlotBounds> lastPlotBoundsForPlayers = new HashMap<>();
-    private final Set<UUID> noPhysicalTriggerPlayers = new HashSet<>();
+    private final Map<UUID, AxiomPermissionSet> playerPermissions = new ConcurrentHashMap<>();
+    private final Map<UUID, PlotSquaredIntegration.PlotBounds> lastPlotBoundsForPlayers = new ConcurrentHashMap<>();
+    private final Set<UUID> noPhysicalTriggerPlayers = ConcurrentHashMap.newKeySet();
     private final OperationQueue operationQueue = new OperationQueue();
+    private final Object dispatchSendsLock = new Object();
     private final Object2IntOpenHashMap<UUID> availableDispatchSends = new Object2IntOpenHashMap<>();
+    private final Map<UUID, ScheduledTask> playerTickTasks = new ConcurrentHashMap<>();
     public Configuration configuration;
 
     public IdMapper<BlockState> allowedBlockRegistry = null;
@@ -98,7 +106,7 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     private int defaultAllowedDispatchSendsPerSecond = 1024;
     private LinkedHashMap<String, Integer> allowedDispatchSendOverrides = new LinkedHashMap<>();
 
-    private boolean registeredNoPhysicalTriggerListener = false;
+    private volatile boolean registeredNoPhysicalTriggerListener = false;
     public boolean logCoreProtectChanges = true;
 
     public Path blueprintFolder = null;
@@ -115,9 +123,42 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     private boolean clearCachedPermissionsOnTick = true;
     private int checkAxiomEnableDisableTimer = 0;
 
+    private String incompatibleDataVersion = "warn";
+    private String unsupportedAxiomVersion = "kick";
+    private String whitelistWorldRegex = null;
+    private String blacklistWorldRegex = null;
+    private boolean disableEntitySanitization = false;
+    private boolean allowTeleportBetweenWorlds = false;
+    private int maxBlockBufferPacketSize = 0;
+
+    private static String orDefault(String value, String fallback) {
+        return value == null ? fallback : value;
+    }
+
+    public String getIncompatibleDataVersion() {
+        return this.incompatibleDataVersion;
+    }
+
+    public String getUnsupportedAxiomVersion() {
+        return this.unsupportedAxiomVersion;
+    }
+
+    public boolean isEntitySanitizationDisabled() {
+        return this.disableEntitySanitization;
+    }
+
+    public boolean isTeleportBetweenWorldsAllowed() {
+        return this.allowTeleportBetweenWorlds;
+    }
+
+    public int getMaxBlockBufferPacketSize() {
+        return this.maxBlockBufferPacketSize;
+    }
+
     @Override
     public void onEnable() {
         PLUGIN = this;
+        AxiomScheduler.init(this);
 
         AxiomReflection.init();
 
@@ -140,6 +181,16 @@ public class AxiomPaper extends JavaPlugin implements Listener {
             this.packetCollectionReadLimit = Short.MAX_VALUE;
             this.maxNbtDecompressLimit = Long.MAX_VALUE;
         }
+
+        // Config values that are read while handling packets. ConfigurationSection is not safe to
+        // read concurrently with the /axiompapermigrateconfig write, so they are snapshotted here.
+        this.incompatibleDataVersion = orDefault(this.configuration.getString("incompatible-data-version"), "warn");
+        this.unsupportedAxiomVersion = orDefault(this.configuration.getString("unsupported-axiom-version"), "kick");
+        this.whitelistWorldRegex = this.configuration.getString("whitelist-world-regex");
+        this.blacklistWorldRegex = this.configuration.getString("blacklist-world-regex");
+        this.disableEntitySanitization = this.configuration.getBoolean("disable-entity-sanitization");
+        this.allowTeleportBetweenWorlds = this.configuration.getBoolean("allow-teleport-between-worlds");
+        this.maxBlockBufferPacketSize = this.configuration.getInt("max-block-buffer-packet-size");
 
         this.whitelistedEntities.clear();
         this.blacklistedEntities.clear();
@@ -246,7 +297,8 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         } catch (IOException ignored) {}
         ServerHeightmaps.load(heightmapsPath);
 
-        Bukkit.getScheduler().scheduleSyncRepeatingTask(this, this::tick, 1, 1);
+        AxiomScheduler.globalAtFixedRate(this::tick, 1L, 1L);
+        AxiomScheduler.global(this::seedExistingMarkers);
 
         this.sendMarkers = this.configuration.getBoolean("send-markers");
         this.maxChunkRelightsPerTick = this.configuration.getInt("max-chunk-relights-per-tick");
@@ -397,6 +449,12 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         this.playerPermissions.remove(uuid);
     }
 
+    /**
+     * Global region tick. Deliberately contains no reads or writes of chunk or entity state: the
+     * per-player work is handed to each player's own region via their entity scheduler, the
+     * operation queue drives itself from region tasks, and the chunk resend/relight queues are
+     * drained by dispatching to the region that owns each chunk.
+     */
     private void tick() {
         if (this.clearCachedPermissionsOnTick) {
             this.playerPermissions.clear();
@@ -405,51 +463,7 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         this.checkAxiomEnableDisableTimer += 1;
         if (this.checkAxiomEnableDisableTimer >= 20) {
             this.checkAxiomEnableDisableTimer = 0;
-
-            Set<UUID> stillActiveAxiomPlayers = new HashSet<>();
-            Set<UUID> stillFailedAxiomPlayers = new HashSet<>();
-
-            for (Player player : Bukkit.getServer().getOnlinePlayers()) {
-                UUID uuid = player.getUniqueId();
-                if (this.activeAxiomPlayers.contains(uuid)) {
-                    if (!this.hasPermission(player, AxiomPermission.USE)) {
-                        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-                        buf.writeBoolean(false);
-                        byte[] bytes = ByteBufUtil.getBytes(buf);
-                        VersionHelper.sendCustomPayload(player, "axiom:enable", bytes);
-
-                        this.failedPermissionAxiomPlayers.add(uuid);
-                        stillFailedAxiomPlayers.add(uuid);
-                    } else {
-                        stillActiveAxiomPlayers.add(uuid);
-                        tickPlayer(player, true);
-                    }
-                } else if (this.failedPermissionAxiomPlayers.contains(uuid)) {
-                    if (this.hasPermission(player, AxiomPermission.USE)) {
-                        VersionHelper.sendCustomPayload(player, "axiom:redo_handshake", new byte[]{});
-                        this.failedPermissionAxiomPlayers.remove(uuid);
-                    } else {
-                        stillFailedAxiomPlayers.add(uuid);
-                    }
-                }
-            }
-
-            this.activeAxiomPlayers.retainAll(stillActiveAxiomPlayers);
-            this.availableDispatchSends.keySet().retainAll(stillActiveAxiomPlayers);
-            this.playerRestrictions.keySet().retainAll(stillActiveAxiomPlayers);
-            this.playerBlockRegistry.keySet().retainAll(stillActiveAxiomPlayers);
-            this.playerProtocolVersion.keySet().retainAll(stillActiveAxiomPlayers);
-            this.lastPlotBoundsForPlayers.keySet().retainAll(stillActiveAxiomPlayers);
-            this.noPhysicalTriggerPlayers.retainAll(stillActiveAxiomPlayers);
-
-            this.failedPermissionAxiomPlayers.retainAll(stillFailedAxiomPlayers);
-        } else {
-            for (UUID uuid : this.activeAxiomPlayers) {
-                Player player = Bukkit.getPlayer(uuid);
-                if (player != null) {
-                    tickPlayer(player, false);
-                }
-            }
+            this.sweepOnlinePlayers();
         }
 
         this.operationQueue.tick();
@@ -461,8 +475,149 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         ImplAxiomHiddenEntities.tick();
     }
 
+    /**
+     * Runs on the global region. Every touch of a player is immediately forwarded to that player's
+     * entity region; the only state manipulated here is Axiom's own bookkeeping. Per-player cleanup
+     * is handled by {@link #onPlayerQuit} rather than a retainAll sweep, because the scheduled work
+     * has not run yet at this point and its results cannot be collected synchronously.
+     */
+    private void sweepOnlinePlayers() {
+        for (Player player : Bukkit.getServer().getOnlinePlayers()) {
+            AxiomScheduler.runOnEntity(player, () -> sweepPlayer(player));
+        }
+    }
+
+    /** Always runs on the owning region of {@code player}. */
+    private void sweepPlayer(Player player) {
+        UUID uuid = player.getUniqueId();
+
+        if (this.activeAxiomPlayers.contains(uuid)) {
+            if (!this.hasPermission(player, AxiomPermission.USE)) {
+                FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+                buf.writeBoolean(false);
+                byte[] bytes = ByteBufUtil.getBytes(buf);
+                VersionHelper.sendCustomPayload(player, "axiom:enable", bytes);
+
+                this.failedPermissionAxiomPlayers.add(uuid);
+                deactivateAxiomPlayer(uuid);
+            } else {
+                ensurePlayerTickTask(player);
+                tickPlayer(player, true);
+            }
+        } else if (this.failedPermissionAxiomPlayers.contains(uuid)) {
+            if (this.hasPermission(player, AxiomPermission.USE)) {
+                VersionHelper.sendCustomPayload(player, "axiom:redo_handshake", new byte[]{});
+                this.failedPermissionAxiomPlayers.remove(uuid);
+            }
+        }
+    }
+
+    /**
+     * Keeps a per-player task alive on that player's region: it refills the dispatch send budget.
+     * EntityScheduler#runAtFixedRate can return null for a rejected task, so the sweep re-arms it
+     * rather than leaving the player throttled down to a few percent of their configured rate.
+     */
+    private void ensurePlayerTickTask(Player player) {
+        UUID uuid = player.getUniqueId();
+        if (this.playerTickTasks.containsKey(uuid)) {
+            return;
+        }
+
+        ScheduledTask task = AxiomScheduler.entityAtFixedRate(player, () -> {
+            if (!this.activeAxiomPlayers.contains(uuid)) {
+                return;
+            }
+            tickPlayer(player, false);
+        }, 1L, 1L);
+
+        if (task != null) {
+            this.playerTickTasks.put(uuid, task);
+        }
+    }
+
+    private void deactivateAxiomPlayer(UUID uuid) {
+        this.activeAxiomPlayers.remove(uuid);
+        this.noPhysicalTriggerPlayers.remove(uuid);
+        this.playerPermissions.remove(uuid);
+        this.playerRestrictions.remove(uuid);
+        this.playerBlockRegistry.remove(uuid);
+        this.playerProtocolVersion.remove(uuid);
+        this.lastPlotBoundsForPlayers.remove(uuid);
+        synchronized (this.dispatchSendsLock) {
+            this.availableDispatchSends.removeInt(uuid);
+        }
+        cancelPlayerTickTask(uuid);
+    }
+
+    private void cancelPlayerTickTask(UUID uuid) {
+        ScheduledTask task = this.playerTickTasks.remove(uuid);
+        if (task != null) {
+            task.cancel();
+        }
+    }
+
+    /**
+     * Gizmo markers are tracked from these events rather than by walking the level's entity list,
+     * which is not region scoped. Both fire on the region owning the entity on Folia.
+     */
+    @EventHandler
+    public void onEntityAddToWorld(EntityAddToWorldEvent event) {
+        if (!this.sendMarkers) {
+            return;
+        }
+        if (event.getEntity() instanceof org.bukkit.entity.Marker marker) {
+            WorldExtension.get((ServerLevel) ((CraftWorld) marker.getWorld()).getHandle()).trackMarker(marker);
+        }
+    }
+
+    @EventHandler
+    public void onEntityRemoveFromWorld(EntityRemoveFromWorldEvent event) {
+        if (!this.sendMarkers) {
+            return;
+        }
+        if (event.getEntity() instanceof org.bukkit.entity.Marker marker) {
+            WorldExtension.get((ServerLevel) ((CraftWorld) marker.getWorld()).getHandle()).untrackMarker(marker);
+        }
+    }
+
+    /**
+     * Entities that already existed when the plugin started never fire
+     * {@link EntityAddToWorldEvent}, so seed the registry from the currently loaded entities once.
+     *
+     * <p>Skipped on a regionised server: there is no single thread allowed to enumerate a level's
+     * entities there, so gizmos placed before the plugin loaded are picked up as their chunks load
+     * instead (the add event fires for every entity entering a world, including on chunk load).
+     */
+    private void seedExistingMarkers() {
+        if (!this.sendMarkers) {
+            return;
+        }
+
+        if (AxiomScheduler.isFolia()) {
+            this.getLogger().info("Gizmo marker seeding is skipped on regionised servers; markers will appear as their chunks load");
+            return;
+        }
+
+        for (World world : Bukkit.getWorlds()) {
+            Collection<org.bukkit.entity.Marker> markers;
+            try {
+                markers = world.getEntitiesByClass(org.bukkit.entity.Marker.class);
+            } catch (Throwable t) {
+                this.getLogger().warning("Unable to seed gizmo markers for world " + world.getName() + ": " + t);
+                continue;
+            }
+            WorldExtension extension = WorldExtension.get((ServerLevel) ((CraftWorld) world).getHandle());
+            for (org.bukkit.entity.Marker marker : markers) {
+                extension.trackMarker(marker);
+            }
+        }
+    }
+
     public void addPendingOperation(ServerLevel level, PendingOperation operation) {
-        this.operationQueue.add(level, operation);
+        if (operation.level() != level) {
+            throw new IllegalArgumentException("Operation was built for a different level");
+        }
+        this.operationQueue.add(operation);
     }
 
     private int getAllowedDispatchSendsPerSecond(Player player) {
@@ -477,10 +632,13 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     public boolean consumeDispatchSends(Player player, int sends, int clientAvailableDispatchSends) {
         int allowedDispatchSendsPerSecond = this.getAllowedDispatchSendsPerSecond(player);
 
-        int currentSends = this.availableDispatchSends.getOrDefault(player.getUniqueId(), allowedDispatchSendsPerSecond*20);
-        currentSends -= sends*20;
-        currentSends = Math.min(currentSends, clientAvailableDispatchSends*20);
-        this.availableDispatchSends.put(player.getUniqueId(), currentSends);
+        int currentSends;
+        synchronized (this.dispatchSendsLock) {
+            currentSends = this.availableDispatchSends.getOrDefault(player.getUniqueId(), allowedDispatchSendsPerSecond*20);
+            currentSends -= sends*20;
+            currentSends = Math.min(currentSends, clientAvailableDispatchSends*20);
+            this.availableDispatchSends.put(player.getUniqueId(), currentSends);
+        }
 
         if (currentSends < -allowedDispatchSendsPerSecond*20) {
             player.kick(net.kyori.adventure.text.Component.text("You are sending updates too fast!"));
@@ -497,20 +655,31 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         this.playerPermissions.remove(player.getUniqueId());
         this.playerRestrictions.remove(player.getUniqueId());
 
-        this.tickPlayer(player, true);
+        ensurePlayerTickTask(player);
+        tickPlayer(player, true);
     }
 
     private void tickPlayer(Player player, boolean updateRestrictions) {
         int allowedDispatchSendsPerSecond = this.getAllowedDispatchSendsPerSecond(player);
 
-        if (!this.availableDispatchSends.containsKey(player.getUniqueId())) {
-            this.availableDispatchSends.put(player.getUniqueId(), allowedDispatchSendsPerSecond*20);
+        boolean first;
+        int previousAllowed20 = 0;
+        int newAllowed20;
+        synchronized (this.dispatchSendsLock) {
+            if (!this.availableDispatchSends.containsKey(player.getUniqueId())) {
+                first = true;
+                newAllowed20 = allowedDispatchSendsPerSecond*20;
+            } else {
+                first = false;
+                previousAllowed20 = this.availableDispatchSends.getInt(player.getUniqueId());
+                newAllowed20 = Math.min(allowedDispatchSendsPerSecond*20, previousAllowed20 + allowedDispatchSendsPerSecond);
+            }
+            this.availableDispatchSends.put(player.getUniqueId(), newAllowed20);
+        }
+
+        if (first) {
             sendUpdateAvailableDispatchSends(player, allowedDispatchSendsPerSecond, allowedDispatchSendsPerSecond);
         } else {
-            int previousAllowed20 = this.availableDispatchSends.getInt(player.getUniqueId());
-            int newAllowed20 = Math.min(allowedDispatchSendsPerSecond*20, previousAllowed20 + allowedDispatchSendsPerSecond);
-            this.availableDispatchSends.put(player.getUniqueId(), newAllowed20);
-
             int previousAllowed = previousAllowed20 / 20;
             int newAllowed = newAllowed20 / 20;
             if (previousAllowed != newAllowed) {
@@ -654,9 +823,17 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     }
 
     public AxiomPermissionSet getPermissions(Player player) {
-        return this.playerPermissions.computeIfAbsent(player.getUniqueId(), uuid -> {
-            return this.calculatePermissions(player);
-        });
+        UUID uuid = player.getUniqueId();
+        AxiomPermissionSet cached = this.playerPermissions.get(uuid);
+        if (cached != null) {
+            return cached;
+        }
+
+        // Deliberately not inside computeIfAbsent: calculatePermissions reads entity state and we
+        // do not want to hold a map bin (and therefore block other players) while doing it.
+        AxiomPermissionSet calculated = calculatePermissions(player);
+        AxiomPermissionSet existing = this.playerPermissions.putIfAbsent(uuid, calculated);
+        return existing != null ? existing : calculated;
     }
 
     public boolean hasPermission(Player player, AxiomPermission axiomPermission) {
@@ -722,36 +899,46 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     }
 
     public int getProtocolVersionFor(UUID uuid) {
-        return this.playerProtocolVersion.getOrDefault(uuid, SharedConstants.getProtocolVersion());
+        Integer version = this.playerProtocolVersion.get(uuid);
+        return version != null ? version : SharedConstants.getProtocolVersion();
     }
 
     public IdMapper<BlockState> getBlockRegistry(UUID uuid) {
-        return this.playerBlockRegistry.getOrDefault(uuid, this.allowedBlockRegistry);
+        IdMapper<BlockState> registry = this.playerBlockRegistry.get(uuid);
+        return registry != null ? registry : this.allowedBlockRegistry;
     }
 
-    private final WeakHashMap<World, ServerWorldPropertiesRegistry> worldProperties = new WeakHashMap<>();
+    private final Map<World, ServerWorldPropertiesRegistry> worldProperties = Collections.synchronizedMap(new WeakHashMap<>());
 
     public @Nullable ServerWorldPropertiesRegistry getWorldPropertiesIfPresent(World world) {
-        return worldProperties.get(world);
+        return this.worldProperties.get(world);
     }
 
     public @Nullable ServerWorldPropertiesRegistry getOrCreateWorldProperties(World world) {
-        if (worldProperties.containsKey(world)) {
-            return worldProperties.get(world);
-        } else {
+        ServerWorldPropertiesRegistry existing = this.worldProperties.get(world);
+        if (existing != null) {
+            return existing;
+        }
+
+        synchronized (this.worldProperties) {
+            if (this.worldProperties.containsKey(world)) {
+                return this.worldProperties.get(world);
+            }
             ServerWorldPropertiesRegistry properties = createWorldProperties(world);
-            worldProperties.put(world, properties);
+            if (properties != null) {
+                this.worldProperties.put(world, properties);
+            }
             return properties;
         }
     }
 
     public boolean canModifyWorld(Player player, World world) {
-        String whitelist = this.configuration.getString("whitelist-world-regex");
+        String whitelist = this.whitelistWorldRegex;
         if (whitelist != null && !whitelist.isBlank() && !world.getName().matches(whitelist)) {
             return false;
         }
 
-        String blacklist = this.configuration.getString("blacklist-world-regex");
+        String blacklist = this.blacklistWorldRegex;
         if (blacklist != null && !blacklist.isBlank() && world.getName().matches(blacklist)) {
             return false;
         }
@@ -805,6 +992,13 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         }
 
         WorldExtension.onPlayerJoin(world, event.getPlayer());
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        UUID uuid = event.getPlayer().getUniqueId();
+        this.failedPermissionAxiomPlayers.remove(uuid);
+        deactivateAxiomPlayer(uuid);
     }
 
     @EventHandler

@@ -8,10 +8,10 @@ import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
-import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class Integration {
 
@@ -38,8 +38,8 @@ public class Integration {
         }
     };
 
-    private static CustomIntegration customIntegration = NO_OP_CUSTOM_INTEGRATION;
-    private static final Map<String, CustomIntegration> customIntegrationsByPlugin = new LinkedHashMap<>();
+    private static volatile CustomIntegration customIntegration = NO_OP_CUSTOM_INTEGRATION;
+    private static final Map<String, CustomIntegration> customIntegrationsByPlugin = Collections.synchronizedMap(new LinkedHashMap<>());
 
     public static void registerCustomIntegration(Plugin plugin, CustomIntegration custom) {
         customIntegrationsByPlugin.put(plugin.getName(), custom);
@@ -74,12 +74,27 @@ public class Integration {
         }
     }
 
+    /*
+     * WorldGuard and PlotSquared both keep server wide, unsynchronised lookup structures
+     * (WorldGuard's RegionContainer/RegionManager, PlotSquared's plot world cache). None of them is
+     * region aware, so every call into them is serialised behind this lock. Without it, several
+     * region threads resolving plot and region lookups for the same player at once would race on
+     * those shared caches. Correctness beats a little parallelism here: these calls are cheap
+     * compared to the block work that follows.
+     */
+    private static final ReentrantLock INTEGRATION_LOCK = new ReentrantLock();
+
     public static boolean canBreakBlock(Player player, Block block) {
         if (player.hasPermission("axiomadmin.bypass_region_checks")) {
             return true;
         }
 
-        return PlotSquaredIntegration.canBreakBlock(player, block) && WorldGuardIntegration.canBreakBlock(player, block.getLocation()) && customIntegration.canBreakBlock(player, block);
+        INTEGRATION_LOCK.lock();
+        try {
+            return PlotSquaredIntegration.canBreakBlock(player, block) && WorldGuardIntegration.canBreakBlock(player, block.getLocation()) && customIntegration.canBreakBlock(player, block);
+        } finally {
+            INTEGRATION_LOCK.unlock();
+        }
     }
 
     public static boolean canPlaceBlock(Player player, org.bukkit.Location loc) {
@@ -87,7 +102,12 @@ public class Integration {
             return true;
         }
 
-        return PlotSquaredIntegration.canPlaceBlock(player, loc) && WorldGuardIntegration.canPlaceBlock(player, loc) && customIntegration.canPlaceBlock(player, loc);
+        INTEGRATION_LOCK.lock();
+        try {
+            return PlotSquaredIntegration.canPlaceBlock(player, loc) && WorldGuardIntegration.canPlaceBlock(player, loc) && customIntegration.canPlaceBlock(player, loc);
+        } finally {
+            INTEGRATION_LOCK.unlock();
+        }
     }
 
     public static SectionPermissionChecker checkSection(Player player, World world, int cx, int cy, int cz) {
@@ -95,22 +115,27 @@ public class Integration {
             return SectionPermissionChecker.ALL_ALLOWED;
         }
 
-        SectionPermissionChecker plotSquared = PlotSquaredIntegration.checkSection(player, world, cx, cy, cz);
-        if (plotSquared.noneAllowed()) {
-            return SectionPermissionChecker.NONE_ALLOWED;
-        }
+        INTEGRATION_LOCK.lock();
+        try {
+            SectionPermissionChecker plotSquared = PlotSquaredIntegration.checkSection(player, world, cx, cy, cz);
+            if (plotSquared.noneAllowed()) {
+                return SectionPermissionChecker.NONE_ALLOWED;
+            }
 
-        SectionPermissionChecker worldGuard = WorldGuardIntegration.checkSection(player, world, cx, cy, cz);
-        if (worldGuard.noneAllowed()) {
-            return SectionPermissionChecker.NONE_ALLOWED;
-        }
+            SectionPermissionChecker worldGuard = WorldGuardIntegration.checkSection(player, world, cx, cy, cz);
+            if (worldGuard.noneAllowed()) {
+                return SectionPermissionChecker.NONE_ALLOWED;
+            }
 
-        SectionPermissionChecker custom = customIntegration.checkSection(player, world, cx, cy, cz);
-        if (custom.noneAllowed()) {
-            return SectionPermissionChecker.NONE_ALLOWED;
-        }
+            SectionPermissionChecker custom = customIntegration.checkSection(player, world, cx, cy, cz);
+            if (custom.noneAllowed()) {
+                return SectionPermissionChecker.NONE_ALLOWED;
+            }
 
-        return SectionPermissionChecker.combine(SectionPermissionChecker.combine(plotSquared, worldGuard), custom);
+            return SectionPermissionChecker.combine(SectionPermissionChecker.combine(plotSquared, worldGuard), custom);
+        } finally {
+            INTEGRATION_LOCK.unlock();
+        }
     }
 
 }
