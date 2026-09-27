@@ -3,6 +3,7 @@ package com.moulberry.axiom.paperapi.display;
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.paperapi.AxiomAlreadyRegisteredException;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import com.moulberry.axiom.paperapi.block.AxiomCustomBlockBuilder;
 import com.moulberry.axiom.paperapi.block.AxiomProperty;
 import com.moulberry.axiom.paperapi.block.ImplAxiomCustomBlock;
@@ -19,23 +20,27 @@ import org.bukkit.plugin.Plugin;
 import org.jetbrains.annotations.ApiStatus;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @ApiStatus.Internal
 public class ImplServerCustomDisplays {
 
-    private static final Map<Identifier, ImplAxiomCustomDisplay> registeredDisplays = new LinkedHashMap<>();
-    private static final Map<Plugin, List<Identifier>> byPlugin = new HashMap<>();
-    private static boolean pendingReregisterAll = false;
-    private static boolean hasRegisteredToAPlayer = false;
+    // Registration happens on plugin lifecycle events while rebroadcasts happen on the global
+    // region tick, so the registries are concurrent.
+    private static final Map<Identifier, ImplAxiomCustomDisplay> registeredDisplays = new ConcurrentHashMap<>();
+    private static final Map<Plugin, List<Identifier>> byPlugin = new ConcurrentHashMap<>();
+    private static volatile boolean pendingReregisterAll = false;
+    private static volatile boolean hasRegisteredToAPlayer = false;
 
     public static void register(Plugin plugin, AxiomCustomDisplayBuilder customDisplayBuilder) throws AxiomAlreadyRegisteredException {
-        if (!MinecraftServer.getServer().isSameThread()) {
+        // Registering is server wide bookkeeping, so the global region is the right place for it:
+        // the main thread on Paper, the global region tick thread on Folia.
+        if (!AxiomScheduler.isGlobalTickThread()) {
             throw new WrongThreadException();
         }
 
@@ -48,7 +53,7 @@ public class ImplServerCustomDisplays {
 
         // Register
         registeredDisplays.put(customDisplay.id(), customDisplay);
-        byPlugin.computeIfAbsent(plugin, k -> new ArrayList<>()).add(customDisplay.id());
+        byPlugin.computeIfAbsent(plugin, k -> Collections.synchronizedList(new ArrayList<>())).add(customDisplay.id());
 
         if (hasRegisteredToAPlayer) {
             pendingReregisterAll = true;

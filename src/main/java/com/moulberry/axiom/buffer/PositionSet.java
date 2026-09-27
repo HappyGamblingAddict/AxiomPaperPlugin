@@ -20,7 +20,7 @@ public class PositionSet {
         this.count = count;
     }
 
-    public int chunkCount() {
+    public int sectionCount() {
         return this.map.size();
     }
 
@@ -32,56 +32,44 @@ public class PositionSet {
         return this.count == 0;
     }
 
-    public void forEach(TriIntConsumer consumer) {
+    /**
+     * Calls {@code consumer} once per 16x16x16 section in this set, passing the section's minimum
+     * block coordinates and its 16x16 bitmask.
+     *
+     * <p>Callers that mutate the world must process each section on the region that owns its chunk,
+     * so this is the granularity they should iterate at: each section belongs to exactly one chunk.
+     */
+    public void forEachSection(SectionConsumer consumer) {
         for (Long2ObjectMap.Entry<short[]> entry : this.map.long2ObjectEntrySet()) {
-            int cx = BlockPos.getX(entry.getLongKey()) * 16;
-            int cy = BlockPos.getY(entry.getLongKey()) * 16;
-            int cz = BlockPos.getZ(entry.getLongKey()) * 16;
+            long key = entry.getLongKey();
+            consumer.accept(BlockPos.getX(key) * 16, BlockPos.getY(key) * 16, BlockPos.getZ(key) * 16, entry.getValue());
+        }
+    }
 
-            int index = 0;
-            for (int z=0; z<16; z++) {
-                for (int y=0; y<16; y++) {
-                    short v = entry.getValue()[index++];
+    /** Expands a single section, as handed out by {@link #forEachSection}. */
+    public static void forEachInSection(int minX, int minY, int minZ, short[] bitmask, TriIntConsumer consumer) {
+        int index = 0;
+        for (int z = 0; z < 16; z++) {
+            for (int y = 0; y < 16; y++) {
+                short v = bitmask[index++];
 
-                    // manually unrolled loop gives 1.7x perf improvement
-                    if (v == -1) {
-                        consumer.accept(cx+0, cy+y, cz+z);
-                        consumer.accept(cx+1, cy+y, cz+z);
-                        consumer.accept(cx+2, cy+y, cz+z);
-                        consumer.accept(cx+3, cy+y, cz+z);
-                        consumer.accept(cx+4, cy+y, cz+z);
-                        consumer.accept(cx+5, cy+y, cz+z);
-                        consumer.accept(cx+6, cy+y, cz+z);
-                        consumer.accept(cx+7, cy+y, cz+z);
-                        consumer.accept(cx+8, cy+y, cz+z);
-                        consumer.accept(cx+9, cy+y, cz+z);
-                        consumer.accept(cx+10, cy+y, cz+z);
-                        consumer.accept(cx+11, cy+y, cz+z);
-                        consumer.accept(cx+12, cy+y, cz+z);
-                        consumer.accept(cx+13, cy+y, cz+z);
-                        consumer.accept(cx+14, cy+y, cz+z);
-                        consumer.accept(cx+15, cy+y, cz+z);
-                    } else if (v != 0) {
-                        if ((v & (1 << 0)) != 0) consumer.accept(cx+0, cy+y, cz+z);
-                        if ((v & (1 << 1)) != 0) consumer.accept(cx+1, cy+y, cz+z);
-                        if ((v & (1 << 2)) != 0) consumer.accept(cx+2, cy+y, cz+z);
-                        if ((v & (1 << 3)) != 0) consumer.accept(cx+3, cy+y, cz+z);
-                        if ((v & (1 << 4)) != 0) consumer.accept(cx+4, cy+y, cz+z);
-                        if ((v & (1 << 5)) != 0) consumer.accept(cx+5, cy+y, cz+z);
-                        if ((v & (1 << 6)) != 0) consumer.accept(cx+6, cy+y, cz+z);
-                        if ((v & (1 << 7)) != 0) consumer.accept(cx+7, cy+y, cz+z);
-                        if ((v & (1 << 8)) != 0) consumer.accept(cx+8, cy+y, cz+z);
-                        if ((v & (1 << 9)) != 0) consumer.accept(cx+9, cy+y, cz+z);
-                        if ((v & (1 << 10)) != 0) consumer.accept(cx+10, cy+y, cz+z);
-                        if ((v & (1 << 11)) != 0) consumer.accept(cx+11, cy+y, cz+z);
-                        if ((v & (1 << 12)) != 0) consumer.accept(cx+12, cy+y, cz+z);
-                        if ((v & (1 << 13)) != 0) consumer.accept(cx+13, cy+y, cz+z);
-                        if ((v & (1 << 14)) != 0) consumer.accept(cx+14, cy+y, cz+z);
-                        if ((v & (1 << 15)) != 0) consumer.accept(cx+15, cy+y, cz+z);
+                if (v == -1) {
+                    for (int x = 0; x < 16; x++) {
+                        consumer.accept(minX + x, minY + y, minZ + z);
+                    }
+                } else if (v != 0) {
+                    for (int x = 0; x < 16; x++) {
+                        if ((v & (1 << x)) != 0) {
+                            consumer.accept(minX + x, minY + y, minZ + z);
+                        }
                     }
                 }
             }
         }
+    }
+
+    public void forEach(TriIntConsumer consumer) {
+        forEachSection((minX, minY, minZ, bitmask) -> forEachInSection(minX, minY, minZ, bitmask, consumer));
     }
 
     public static PositionSet read(FriendlyByteBuf buf) {
@@ -103,6 +91,11 @@ public class PositionSet {
         }
 
         return new PositionSet(map, count);
+    }
+
+    @FunctionalInterface
+    public interface SectionConsumer {
+        void accept(int minX, int minY, int minZ, short[] bitmask);
     }
 
 }

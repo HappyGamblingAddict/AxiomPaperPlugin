@@ -5,6 +5,7 @@ import com.moulberry.axiom.annotations.AnnotationUpdateAction;
 import com.moulberry.axiom.annotations.ServerAnnotations;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
+import com.moulberry.axiom.scheduler.AxiomScheduler;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.server.level.ServerPlayer;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
@@ -42,8 +43,9 @@ public class UpdateAnnotationPacketListener implements PacketHandler {
             }
         }
 
-        // Execute
-        serverPlayer.level().getServer().execute(() -> {
+        // Execute. Annotations are stored in the world's persistent data container and broadcast to
+        // every player in the world, so this belongs on the global region rather than the player's.
+        AxiomScheduler.global(() -> {
             try {
                 ServerAnnotations.handleUpdates(serverPlayer.level().getWorld(), actions);
             } catch (Throwable t) {

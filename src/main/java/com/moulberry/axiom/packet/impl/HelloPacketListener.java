@@ -38,8 +38,7 @@ public class HelloPacketListener implements PacketHandler {
 
             this.plugin.sendGoodbyeReason(player, message);
 
-            String unsupportedAxiomVersion = plugin.configuration.getString("unsupported-axiom-version");
-            if (unsupportedAxiomVersion == null) unsupportedAxiomVersion = "kick";
+            String unsupportedAxiomVersion = plugin.getUnsupportedAxiomVersion();
             if (unsupportedAxiomVersion.equals("warn")) {
                 player.sendMessage(Component.text(message).color(NamedTextColor.RED));
                 return;
@@ -64,9 +63,7 @@ public class HelloPacketListener implements PacketHandler {
 
         int serverDataVersion = DFUHelper.DATA_VERSION;
         if (protocolVersion != SharedConstants.getProtocolVersion()) {
-            String incompatibleDataVersion = plugin.configuration.getString("incompatible-data-version");
-            if (incompatibleDataVersion == null) incompatibleDataVersion = "warn";
-
+            String incompatibleDataVersion = plugin.getIncompatibleDataVersion();
             if (!Bukkit.getPluginManager().isPluginEnabled("ViaVersion")) {
                 String message = "Axiom: Incompatible data version detected (client " + dataVersion +
                     ", server " + serverDataVersion  + ")";
